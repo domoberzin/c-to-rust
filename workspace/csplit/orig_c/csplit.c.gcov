@@ -1,0 +1,471 @@
+        -:    0:Source:csplit.c
+        -:    0:Graph:./csplit.gcno
+        -:    0:Data:./csplit.gcda
+        -:    0:Runs:1
+        -:    1:/*	$OpenBSD: csplit.c,v 1.10 2021/07/08 00:38:42 millert Exp $	*/
+        -:    2:/*	$FreeBSD: src/usr.bin/csplit/csplit.c,v 1.9 2004/03/22 11:15:03 tjr Exp $	*/
+        -:    3:
+        -:    4:/*-
+        -:    5: * Copyright (c) 2002 Tim J. Robbins.
+        -:    6: * All rights reserved.
+        -:    7: *
+        -:    8: * Redistribution and use in source and binary forms, with or without
+        -:    9: * modification, are permitted provided that the following conditions
+        -:   10: * are met:
+        -:   11: * 1. Redistributions of source code must retain the above copyright
+        -:   12: *    notice, this list of conditions and the following disclaimer.
+        -:   13: * 2. Redistributions in binary form must reproduce the above copyright
+        -:   14: *    notice, this list of conditions and the following disclaimer in the
+        -:   15: *    documentation and/or other materials provided with the distribution.
+        -:   16: *
+        -:   17: * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+        -:   18: * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+        -:   19: * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+        -:   20: * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+        -:   21: * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+        -:   22: * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+        -:   23: * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+        -:   24: * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+        -:   25: * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+        -:   26: * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+        -:   27: * SUCH DAMAGE.
+        -:   28: */
+        -:   29:
+        -:   30:/*
+        -:   31: * csplit -- split files based on context
+        -:   32: *
+        -:   33: * This utility splits its input into numbered output files by line number
+        -:   34: * or by a regular expression. Regular expression matches have an optional
+        -:   35: * offset with them, allowing the split to occur a specified number of
+        -:   36: * lines before or after the match.
+        -:   37: *
+        -:   38: * To handle negative offsets, we stop reading when the match occurs and
+        -:   39: * store the offset that the file should have been split at, then use
+        -:   40: * this output file as input until all the "overflowed" lines have been read.
+        -:   41: * The file is then closed and truncated to the correct length.
+        -:   42: *
+        -:   43: * We assume that the output files can be seeked upon (ie. they cannot be
+        -:   44: * symlinks to named pipes or character devices), but make no such
+        -:   45: * assumption about the input.
+        -:   46: */
+        -:   47:
+        -:   48:#include <sys/types.h>
+        -:   49:
+        -:   50:#include <ctype.h>
+        -:   51:#include <err.h>
+        -:   52:#include <errno.h>
+        -:   53:#include <limits.h>
+        -:   54:#include <regex.h>
+        -:   55:#include <signal.h>
+        -:   56:#include <stdint.h>
+        -:   57:#include <stdio.h>
+        -:   58:#include <stdlib.h>
+        -:   59:#include <string.h>
+        -:   60:#include <unistd.h>
+        -:   61:
+        -:   62:void	 cleanup(void);
+        -:   63:void	 do_lineno(const char *);
+        -:   64:void	 do_rexp(const char *);
+        -:   65:char	*get_line(void);
+        -:   66:void	 handlesig(int);
+        -:   67:FILE	*newfile(void);
+        -:   68:void	 toomuch(FILE *, long);
+        -:   69:static void usage(void);
+        -:   70:
+        -:   71:/*
+        -:   72: * Command line options
+        -:   73: */
+        -:   74:const char *prefix;		/* File name prefix */
+        -:   75:long	 sufflen;		/* Number of decimal digits for suffix */
+        -:   76:int	 sflag;			/* Suppress output of file names */
+        -:   77:int	 kflag;			/* Keep output if error occurs */
+        -:   78:
+        -:   79:/*
+        -:   80: * Other miscellaneous globals (XXX too many)
+        -:   81: */
+        -:   82:long	 lineno;		/* Current line number in input file */
+        -:   83:long	 reps;			/* Number of repetitions for this pattern */
+        -:   84:long	 nfiles;		/* Number of files output so far */
+        -:   85:long	 maxfiles;		/* Maximum number of files we can create */
+        -:   86:char	 currfile[PATH_MAX];	/* Current output file */
+        -:   87:const char *infn;		/* Name of the input file */
+        -:   88:FILE	*infile;		/* Input file handle */
+        -:   89:FILE	*overfile;		/* Overflow file for toomuch() */
+        -:   90:off_t	 truncofs;		/* Offset this file should be truncated at */
+        -:   91:int	 doclean;		/* Should cleanup() remove output? */
+        -:   92:
+        -:   93:int
+        1:   94:main(int argc, char *argv[])
+        -:   95:{
+        -:   96:	struct sigaction sa;
+        -:   97:	long i;
+        -:   98:	int ch;
+        -:   99:	const char *expr;
+        -:  100:	char *ep, *p;
+        -:  101:	FILE *ofp;
+        -:  102:
+        1:  103:	kflag = sflag = 0;
+        1:  104:	prefix = "xx";
+        1:  105:	sufflen = 2;
+        1:  106:	while ((ch = getopt(argc, argv, "f:kn:s")) != -1) {
+    #####:  107:		switch (ch) {
+    #####:  108:		case 'f':
+    #####:  109:			prefix = optarg;
+    #####:  110:			break;
+    #####:  111:		case 'k':
+    #####:  112:			kflag = 1;
+    #####:  113:			break;
+    #####:  114:		case 'n':
+    #####:  115:			errno = 0;
+    #####:  116:			sufflen = strtol(optarg, &ep, 10);
+    #####:  117:			if (sufflen <= 0 || *ep != '\0' || errno != 0)
+    #####:  118:				errx(1, "%s: bad suffix length", optarg);
+    #####:  119:			break;
+    #####:  120:		case 's':
+    #####:  121:			sflag = 1;
+    #####:  122:			break;
+    #####:  123:		default:
+    #####:  124:			usage();
+        -:  125:		}
+        -:  126:	}
+        -:  127:
+        1:  128:	if (sufflen + strlen(prefix) >= PATH_MAX)
+    #####:  129:		errx(1, "name too long");
+        -:  130:
+        1:  131:	argc -= optind;
+        1:  132:	argv += optind;
+        -:  133:
+        1:  134:	if ((infn = *argv++) == NULL)
+    #####:  135:		usage();
+        1:  136:	if (strcmp(infn, "-") == 0) {
+    #####:  137:		infile = stdin;
+    #####:  138:		infn = "stdin";
+        1:  139:	} else if ((infile = fopen(infn, "r")) == NULL)
+    #####:  140:		err(1, "%s", infn);
+        -:  141:
+        1:  142:	if (!kflag) {
+        1:  143:		doclean = 1;
+        1:  144:		atexit(cleanup);
+        1:  145:		sa.sa_flags = 0;
+        1:  146:		sa.sa_handler = handlesig;
+        1:  147:		sigemptyset(&sa.sa_mask);
+        1:  148:		sigaddset(&sa.sa_mask, SIGHUP);
+        1:  149:		sigaddset(&sa.sa_mask, SIGINT);
+        1:  150:		sigaddset(&sa.sa_mask, SIGTERM);
+        1:  151:		sigaction(SIGHUP, &sa, NULL);
+        1:  152:		sigaction(SIGINT, &sa, NULL);
+        1:  153:		sigaction(SIGTERM, &sa, NULL);
+        -:  154:	}
+        -:  155:
+        1:  156:	lineno = 0;
+        1:  157:	nfiles = 0;
+        1:  158:	truncofs = 0;
+        1:  159:	overfile = NULL;
+        -:  160:
+        -:  161:	/* Ensure 10^sufflen < LONG_MAX. */
+        3:  162:	for (maxfiles = 1, i = 0; i < sufflen; i++) {
+        2:  163:		if (maxfiles > LONG_MAX / 10)
+    #####:  164:			errx(1, "%ld: suffix too long (limit %ld)",
+        -:  165:			    sufflen, i);
+        2:  166:		maxfiles *= 10;
+        -:  167:	}
+        -:  168:
+        -:  169:	/* Create files based on supplied patterns. */
+        2:  170:	while (nfiles < maxfiles - 1 && (expr = *argv++) != NULL) {
+        -:  171:		/* Look ahead & see if this pattern has any repetitions. */
+       1*:  172:		if (*argv != NULL && **argv == '{') {
+    #####:  173:			errno = 0;
+    #####:  174:			reps = strtol(*argv + 1, &ep, 10);
+    #####:  175:			if (reps < 0 || *ep != '}' || errno != 0)
+    #####:  176:				errx(1, "%s: bad repetition count", *argv + 1);
+    #####:  177:			argv++;
+        -:  178:		} else
+        1:  179:			reps = 0;
+        -:  180:
+        1:  181:		if (*expr == '/' || *expr == '%') {
+        -:  182:			do {
+    #####:  183:				do_rexp(expr);
+    #####:  184:			} while (reps-- != 0 && nfiles < maxfiles - 1);
+        1:  185:		} else if (isdigit((unsigned char)*expr))
+        1:  186:			do_lineno(expr);
+        -:  187:		else
+    #####:  188:			errx(1, "%s: unrecognised pattern", expr);
+        -:  189:	}
+        -:  190:
+        -:  191:	/* Copy the rest into a new file. */
+        1:  192:	if (!feof(infile)) {
+        1:  193:		ofp = newfile();
+        4:  194:		while ((p = get_line()) != NULL)
+        3:  195:			fputs(p, ofp); // changed: write to file without check.
+        1:  196:		if (!sflag)
+        1:  197:			printf("%jd\n", (intmax_t)ftello(ofp));
+        1:  198:		if (fclose(ofp) != 0)
+    #####:  199:			err(1, "%s", currfile);
+        -:  200:	}
+        -:  201:
+        1:  202:	toomuch(NULL, 0);
+        1:  203:	doclean = 0;
+        -:  204:
+        1:  205:	return (0);
+        -:  206:}
+        -:  207:
+        -:  208:static void
+    #####:  209:usage(void)
+        -:  210:{
+        -:  211:	extern const char *__progname;
+        -:  212:
+    #####:  213:	fprintf(stderr,
+        -:  214:	    "usage: %s [-ks] [-f prefix] [-n number] file args ...\n",
+        -:  215:	    __progname);
+    #####:  216:	exit(1);
+        -:  217:}
+        -:  218:
+        -:  219:/* ARGSUSED */
+        -:  220:void
+    #####:  221:handlesig(int sig)
+        -:  222:{
+    #####:  223:	const char msg[] = "csplit: caught signal, cleaning up\n";
+        -:  224:
+    #####:  225:	write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    #####:  226:	cleanup();
+    #####:  227:	_exit(2);
+        -:  228:}
+        -:  229:
+        -:  230:/* Create a new output file. */
+        -:  231:FILE *
+        2:  232:newfile(void)
+        -:  233:{
+        -:  234:	FILE *fp;
+        -:  235:
+        2:  236:	if ((size_t)snprintf(currfile, sizeof(currfile), "%s%0*ld", prefix,
+        -:  237:	    (int)sufflen, nfiles) >= sizeof(currfile)) {
+    #####:  238:		errno = ENAMETOOLONG;
+    #####:  239:		err(1, "%s", currfile);
+        -:  240:	}
+        2:  241:	if ((fp = fopen(currfile, "w+")) == NULL)
+    #####:  242:		err(1, "%s", currfile);
+        2:  243:	nfiles++;
+        -:  244:
+        2:  245:	return (fp);
+        -:  246:}
+        -:  247:
+        -:  248:/* Remove partial output, called before exiting. */
+        -:  249:void
+        1:  250:cleanup(void)
+        -:  251:{
+        -:  252:	char fnbuf[PATH_MAX];
+        -:  253:	long i;
+        -:  254:
+        1:  255:	if (!doclean)
+        1:  256:		return;
+        -:  257:
+        -:  258:	/*
+        -:  259:	 * NOTE: One cannot portably assume to be able to call snprintf() from
+        -:  260:	 * inside a signal handler.  It is, however, safe to do on OpenBSD.
+        -:  261:	 */
+    #####:  262:	for (i = 0; i < nfiles; i++) {
+    #####:  263:		snprintf(fnbuf, sizeof(fnbuf), "%s%0*ld", prefix,
+        -:  264:		    (int)sufflen, i);
+    #####:  265:		unlink(fnbuf);
+        -:  266:	}
+        -:  267:}
+        -:  268:
+        -:  269:/* Read a line from the input into a static buffer. */
+        -:  270:char *
+        6:  271:get_line(void)
+        -:  272:{
+        -:  273:	static char lbuf[LINE_MAX];
+        -:  274:	FILE *src;
+        -:  275:
+       6*:  276:	src = overfile != NULL ? overfile : infile;
+        -:  277:
+        6:  278:again: if (fgets(lbuf, sizeof(lbuf), src) == NULL) {
+        1:  279:		if (src == overfile) {
+    #####:  280:			src = infile;
+    #####:  281:			goto again;
+        -:  282:		}
+        1:  283:		return (NULL);
+        -:  284:	}
+        5:  285:	if (ferror(src))
+    #####:  286:		err(1, "%s", infn);
+        5:  287:	lineno++;
+        -:  288:
+        5:  289:	return (lbuf);
+        -:  290:}
+        -:  291:
+        -:  292:/* Conceptually rewind the input (as obtained by get_line()) back `n' lines. */
+        -:  293:void
+        1:  294:toomuch(FILE *ofp, long n)
+        -:  295:{
+        -:  296:	char buf[BUFSIZ];
+        -:  297:	size_t i, nread;
+        -:  298:
+        1:  299:	if (overfile != NULL) {
+        -:  300:		/*
+        -:  301:		 * Truncate the previous file we overflowed into back to
+        -:  302:		 * the correct length, close it.
+        -:  303:		 */
+    #####:  304:		if (fflush(overfile) != 0)
+    #####:  305:			err(1, "overflow");
+    #####:  306:		if (ftruncate(fileno(overfile), truncofs) != 0)
+    #####:  307:			err(1, "overflow");
+    #####:  308:		if (fclose(overfile) != 0)
+    #####:  309:			err(1, "overflow");
+    #####:  310:		overfile = NULL;
+        -:  311:	}
+        -:  312:
+        1:  313:	if (n == 0)
+        -:  314:		/* Just tidying up */
+        1:  315:		return;
+        -:  316:
+    #####:  317:	lineno -= n;
+        -:  318:
+        -:  319:	/*
+        -:  320:	 * Wind the overflow file backwards to `n' lines before the
+        -:  321:	 * current one.
+        -:  322:	 */
+        -:  323:	do {
+    #####:  324:		if (ftello(ofp) < (off_t)sizeof(buf))
+    #####:  325:			rewind(ofp);
+        -:  326:		else
+    #####:  327:			fseeko(ofp, -(off_t)sizeof(buf), SEEK_CUR);
+    #####:  328:		if (ferror(ofp))
+    #####:  329:			errx(1, "%s: can't seek", currfile);
+    #####:  330:		if ((nread = fread(buf, 1, sizeof(buf), ofp)) == 0)
+    #####:  331:			errx(1, "can't read overflowed output");
+    #####:  332:		if (fseeko(ofp, -(off_t)nread, SEEK_CUR) != 0)
+    #####:  333:			err(1, "%s", currfile);
+    #####:  334:		for (i = 1; i <= nread; i++)
+    #####:  335:			if (buf[nread - i] == '\n' && n-- == 0)
+    #####:  336:				break;
+    #####:  337:		if (ftello(ofp) == 0)
+    #####:  338:			break;
+    #####:  339:	} while (n > 0);
+    #####:  340:	if (fseeko(ofp, (off_t)(nread - i + 1), SEEK_CUR) != 0)
+    #####:  341:		err(1, "%s", currfile);
+        -:  342:
+        -:  343:	/*
+        -:  344:	 * get_line() will read from here. Next call will truncate to
+        -:  345:	 * truncofs in this file.
+        -:  346:	 */
+    #####:  347:	overfile = ofp;
+    #####:  348:	truncofs = ftello(overfile);
+        -:  349:}
+        -:  350:
+        -:  351:/* Handle splits for /regexp/ and %regexp% patterns. */
+        -:  352:void
+    #####:  353:do_rexp(const char *expr)
+        -:  354:{
+        -:  355:	regex_t cre;
+        -:  356:	intmax_t nwritten;
+        -:  357:	long ofs;
+        -:  358:	int first;
+        -:  359:	char *ecopy, *ep, *p, *pofs, *re;
+        -:  360:	FILE *ofp;
+        -:  361:
+    #####:  362:	if ((ecopy = strdup(expr)) == NULL)
+    #####:  363:		err(1, "strdup");
+        -:  364:
+    #####:  365:	re = ecopy + 1;
+    #####:  366:	if ((pofs = strrchr(ecopy, *expr)) == NULL || pofs[-1] == '\\')
+    #####:  367:		errx(1, "%s: missing trailing %c", expr, *expr);
+    #####:  368:	*pofs++ = '\0';
+        -:  369:
+    #####:  370:	if (*pofs != '\0') {
+    #####:  371:		errno = 0;
+    #####:  372:		ofs = strtol(pofs, &ep, 10);
+    #####:  373:		if (*ep != '\0' || errno != 0)
+    #####:  374:			errx(1, "%s: bad offset", pofs);
+        -:  375:	} else
+    #####:  376:		ofs = 0;
+        -:  377:
+    #####:  378:	if (regcomp(&cre, re, REG_NOSUB) != 0)
+    #####:  379:		errx(1, "%s: bad regular expression", re);
+        -:  380:
+    #####:  381:	if (*expr == '/')
+        -:  382:		/* /regexp/: Save results to a file. */
+    #####:  383:		ofp = newfile();
+        -:  384:	else {
+        -:  385:		/* %regexp%: Make a temporary file for overflow. */
+    #####:  386:		if ((ofp = tmpfile()) == NULL)
+    #####:  387:			err(1, "tmpfile");
+        -:  388:	}
+        -:  389:
+        -:  390:	/* Read and output lines until we get a match. */
+    #####:  391:	first = 1;
+    #####:  392:	while ((p = get_line()) != NULL) {
+        -:  393:		// Changed: write to file without check.
+    #####:  394:		fputs(p, ofp);
+    #####:  395:		if (!first && regexec(&cre, p, 0, NULL, 0) == 0)
+    #####:  396:			break;
+    #####:  397:		first = 0;
+        -:  398:	}
+        -:  399:
+    #####:  400:	if (p == NULL) {
+    #####:  401:		toomuch(NULL, 0);
+    #####:  402:		errx(1, "%s: no match", re);
+        -:  403:	}
+        -:  404:
+    #####:  405:	if (ofs <= 0) {
+        -:  406:		/*
+        -:  407:		 * Negative (or zero) offset: throw back any lines we should
+        -:  408:		 * not have read yet.
+        -:  409:		  */
+    #####:  410:		if (p != NULL) {
+    #####:  411:			toomuch(ofp, -ofs + 1);
+    #####:  412:			nwritten = (intmax_t)truncofs;
+        -:  413:		} else
+    #####:  414:			nwritten = (intmax_t)ftello(ofp);
+        -:  415:	} else {
+        -:  416:		/*
+        -:  417:		 * Positive offset: copy the requested number of lines
+        -:  418:		 * after the match.
+        -:  419:		 */
+    #####:  420:		while (--ofs > 0 && (p = get_line()) != NULL)
+    #####:  421:			fputs(p, ofp);
+    #####:  422:		toomuch(NULL, 0);
+    #####:  423:		nwritten = (intmax_t)ftello(ofp);
+    #####:  424:		if (fclose(ofp) != 0)
+    #####:  425:			err(1, "%s", currfile);
+        -:  426:	}
+        -:  427:
+    #####:  428:	if (!sflag && *expr == '/')
+    #####:  429:		printf("%jd\n", nwritten);
+        -:  430:
+    #####:  431:	regfree(&cre);
+    #####:  432:	free(ecopy);
+    #####:  433:}
+        -:  434:
+        -:  435:/* Handle splits based on line number. */
+        -:  436:void
+        1:  437:do_lineno(const char *expr)
+        -:  438:{
+        -:  439:	long lastline, tgtline;
+        -:  440:	char *ep, *p;
+        -:  441:	FILE *ofp;
+        -:  442:
+        1:  443:	errno = 0;
+        1:  444:	tgtline = strtol(expr, &ep, 10);
+        1:  445:	if (tgtline <= 0 || errno != 0 || *ep != '\0')
+    #####:  446:		errx(1, "%s: bad line number", expr);
+        1:  447:	lastline = tgtline;
+        1:  448:	if (lastline <= lineno)
+    #####:  449:		errx(1, "%s: can't go backwards", expr);
+        -:  450:
+        1:  451:	while (nfiles < maxfiles - 1) {
+        1:  452:		ofp = newfile();
+        3:  453:		while (lineno + 1 != lastline) {
+        2:  454:			if ((p = get_line()) == NULL)
+    #####:  455:				errx(1, "%ld: out of range", lastline);
+        -:  456:			// Changed: write to file without check.
+        2:  457:			fputs(p, ofp);
+        -:  458:		}
+        1:  459:		if (!sflag)
+        1:  460:			printf("%jd\n", (intmax_t)ftello(ofp));
+        1:  461:		if (fclose(ofp) != 0)
+    #####:  462:			err(1, "%s", currfile);
+        1:  463:		if (reps-- == 0)
+        1:  464:			break;
+    #####:  465:		lastline += tgtline;
+        -:  466:	} 
+        1:  467:}

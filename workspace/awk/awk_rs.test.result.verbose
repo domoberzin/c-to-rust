@@ -1,0 +1,235 @@
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs -F '[#]' '{ print NF }'
+PASS: awk -F case 0
+======================
+echo -ne '' >input
+echo -ne '\n' | target/debug/awk_rs -F '[#]' '{ print NF }'
+PASS: awk -F case 1
+======================
+echo -ne '' >input
+echo -ne '#\n' | target/debug/awk_rs -F '[#]' '{ print NF }'
+PASS: awk -F case 2
+======================
+echo -ne '' >input
+echo -ne '#abc#\n' | target/debug/awk_rs -F '[#]' '{ print NF }'
+PASS: awk -F case 3
+======================
+echo -ne '' >input
+echo -ne '#abc#zz\n' | target/debug/awk_rs -F '[#]' '{ print NF }'
+PASS: awk -F case 4
+======================
+echo -ne '' >input
+echo -ne '#abc##zz\n' | target/debug/awk_rs -F '[#]' '{ print NF }'
+PASS: awk -F case 5
+======================
+echo -ne '' >input
+echo -ne 'z#abc##zz\n' | target/debug/awk_rs -F '[#]' '{ print NF }'
+PASS: awk -F case 6
+======================
+echo -ne '' >input
+echo -ne 'z##abc##zz\n' | target/debug/awk_rs -F '[#]' '{ print NF }'
+PASS: awk -F case 7
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs 'BEGIN{if(23==23) print "foo"}'
+PASS: awk if operator == 
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs 'BEGIN{if(23!=23) print "bar"}'
+PASS: awk if operator != 
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs 'BEGIN{if(23>=23) print "foo"}'
+PASS: awk if operator >= 
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs 'BEGIN{if(2 < 13) print "foo"}'
+PASS: awk if operator < 
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs 'BEGIN{if("a"=="ab") print "bar"}'
+PASS: awk if string == 
+======================
+echo -ne '' >input
+echo -ne '\n' | target/debug/awk_rs '{ print or(4294967295,1) }'
+PASS: awk bitwise op
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs '
+function empty_fun(count) {
+  # empty
+}
+END {
+  i=1
+  print "L" i "\n"
+  empty_fun(i + i + ++i)
+  print "L" i "\n"
+}'
+PASS: awk handles empty function f(arg){}
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs '
+function outer_fun() {
+  return 1
+}
+END {
+  i=1
+  print "L" i "\n"
+  i += outer_fun()
+  print "L" i "\n"
+}'
+PASS: awk properly handles function from other scope
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs '
+END {
+  i=1
+  print "L" i "\n"
+  i + trigger_error_fun()
+  print "L" i "\n"
+}' 2>&1
+PASS: awk properly handles undefined function
+SKIPPED: awk hex const 1
+SKIPPED: awk hex const 2
+SKIPPED: awk oct const
+======================
+echo -ne '' >input
+echo -ne '\n' | target/debug/awk_rs '{ printf "%f %f\n", "000.123", "009.123" }'
+PASS: awk floating const with leading zeroes
+======================
+echo -ne '' >input
+echo -ne 'Hi\n' | target/debug/awk_rs 'gsub("@(samp|code|file)\{","");'; echo $?
+PASS: awk gsub falls back to non-extended-regex
+SKIPPED: awk 'gcc build bug'
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs 'BEGIN { print ":" NF ":" $0 ":" $1 ":" $2 ":" }'
+PASS: awk NF in BEGIN
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs '
+function b(tmp) {
+	tmp = 0;
+	print "" tmp; #this line causes the bug
+	return tmp;
+}
+function c(tmpc) {
+	tmpc = b(); return tmpc;
+}
+BEGIN {
+	print (c() ? "string" : "number");
+}'
+PASS: awk string cast (bug 725)
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs 'BEGIN { arr [3] = 1; print arr [3] }'
+PASS: awk handles whitespace before array subscript
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs 'BEGIN { getline line <"doesnt_exist"; print ERRNO; ERRNO=0; close("doesnt_exist"); print ERRNO; print "Ok" }'
+PASS: awk handles non-existing file correctly
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs '
+BEGIN {
+  u["a"]=1
+  u["b"]=1
+  u["c"]=1
+  v["d"]=1
+  v["e"]=1
+  v["f"]=1
+  for (l in u) {
+    print "outer1", l;
+    for (l in v) {
+      print " inner", l;
+    }
+    print "outer2", l;
+  }
+  print "end", l;
+  l="a"
+  exit;
+}'
+PASS: awk nested loops with the same variable
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs '
+BEGIN{
+cnt = 0
+a[cnt] = "zeroth"
+a[++cnt] = "first"
+delete a[cnt--]
+print cnt
+print "[0]:" a[0]
+print "[1]:" a[1]
+}'
+PASS: awk 'delete a[v--]' evaluates v-- once
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs 'func f(,) { }' 2>&1
+PASS: awk func arg parsing 1
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs 'func f(a,,b) { }' 2>&1
+PASS: awk func arg parsing 2
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs 'func f(a,) { }' 2>&1
+PASS: awk func arg parsing 3
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs 'func f(a b) { }' 2>&1
+PASS: awk func arg parsing 4
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs 'BEGIN {print()}' 2>&1
+PASS: awk handles empty ()
+======================
+echo -ne '' >input
+echo -ne 'a:b c:d\ne:f g:h' | target/debug/awk_rs '{FS=":"; print $1}'
+PASS: awk FS assignment
+SKIPPED: awk large integer
+======================
+echo -ne '' >input
+echo -ne '' | target/debug/awk_rs 'BEGIN{ A[1]=2; A["qwe"]="asd"; print length(A)}'
+PASS: awk length(array)
+======================
+echo -ne '' >input
+echo -ne 'qwe' | target/debug/awk_rs '{print length; print length(); print length("qwe"); print length(99+9)}'
+PASS: awk length()
+======================
+echo -ne '' >input
+echo -ne '\n' | target/debug/awk_rs '{ print length, 1 }'
+PASS: awk print length, 1
+======================
+echo -ne '' >input
+echo -ne '\n' | awk '{ print length 1 }'
+PASS: awk print length 1
+======================
+echo -ne '' >input
+echo -ne '\n' | target/debug/awk_rs 'length == 0 { print "foo" }'
+PASS: awk length == 0
+======================
+echo -ne '' >input
+echo -ne '\n' | target/debug/awk_rs '{ if (length == 0) { print "bar" } }'
+PASS: awk if (length == 0)
+======================
+echo -ne 'do re mi\n' >input
+echo -ne '{print $2; print ARGC;}' | target/debug/awk_rs -f - input
+PASS: awk -f and ARGC
+SKIPPED: awk -e and ARGC
+SKIPPED: awk handles invalid for loop
+SKIPPED: awk handles colon not preceded by ternary
+SKIPPED: awk errors on missing delete arg
+======================
+echo -ne '' >input
+echo -ne 'anything' | target/debug/awk_rs -v i=1 "BEGIN {print \"str\" ++i}"
+PASS: awk do not allow "str"++
+======================
+echo -ne '' >input
+echo -ne 'foo--bar' | target/debug/awk_rs -F '-*' '{print $1 "-" $2 "=" $3 "*" $4}'
+PASS: awk FS regex which can match empty string
+======================
+echo -ne '' >input
+echo -ne 'a=====123=' | target/debug/awk_rs -F '=+' '{print $NF}'
+PASS: awk $NF is empty

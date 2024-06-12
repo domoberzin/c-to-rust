@@ -1,0 +1,458 @@
+use regex::Regex;
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, BufWriter, Write, Read, Seek, SeekFrom};
+use std::path::PathBuf;
+use std::process;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use signal_hook::consts::TERM_SIGNALS;
+use signal_hook::iterator::Signals;
+
+// Global state to simulate C global variables
+struct GlobalState {
+    prefix: String,
+    sufflen: usize,
+    sflag: bool,
+    kflag: bool,
+    lineno: i64,
+    reps: i64,
+    nfiles: i64,
+    maxfiles: i64,
+    currfile: PathBuf,
+    infn: String,
+    infile: Option<Box<BufReader<File>>>,
+    overfile: Option<File>,
+    truncofs: u64,
+    doclean: bool,
+}
+
+impl GlobalState {
+    fn new() -> Self {
+        Self {
+            prefix: String::from("xx"),
+            sufflen: 2,
+            sflag: false,
+            kflag: false,
+            lineno: 0,
+            reps: 0,
+            nfiles: 0,
+            maxfiles: 0,
+            currfile: PathBuf::new(),
+            infn: String::new(),
+            infile: None,
+            overfile: None,
+            truncofs: 0,
+            doclean: false,
+        }
+    }
+}
+
+// static mut STATE: GlobalState = GlobalState::new();
+
+// fn cleanup() {
+//     unsafe {
+//         if !STATE.doclean {
+//             return;
+//         }
+//         for i in 0..STATE.nfiles {
+//             let filename = format!("{}{:0width$}", STATE.prefix, i, width = STATE.sufflen as usize);
+//             let _ = fs::remove_file(filename);
+//         }
+//     }
+// }
+
+fn cleanup(state: &GlobalState) -> io::Result<()> {
+    if !state.doclean {
+        return Ok(());
+    }
+
+    for i in 0..state.nfiles {
+        let filename = format!("{}{:0width$}", state.prefix, i, width = state.sufflen);
+        let path = PathBuf::from(&filename);
+        let _ = fs::remove_file(path); // Ignore errors in case file doesn't exist
+    }
+    Ok(())
+}
+
+
+fn handlesig(_: i32) {
+    let msg = "csplit: caught signal, cleaning up\n";
+    let _ = io::stderr().write_all(msg.as_bytes());
+    // cleanup(&STATE);
+    process::exit(2);
+}
+
+// fn newfile() -> io::Result<File> {
+//     unsafe {
+//         let filename = format!("{}{:0width$}", STATE.prefix, STATE.nfiles, width = STATE.sufflen as usize);
+//         STATE.currfile = PathBuf::from(&filename);
+//         let file = OpenOptions::new().write(true).create_new(true).open(&STATE.currfile)?;
+//         STATE.nfiles += 1;
+//         Ok(file)
+//     }
+// }
+
+// fn get_line(reader: &mut BufReader<File>) -> io::Result<String> {
+//     unsafe {
+//         let mut line = String::new();
+//         match reader.read_line(&mut line) {
+//             Ok(0) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF reached")),
+//             Ok(_) => {
+//                 STATE.lineno += 1;
+//                 Ok(line)
+//             }
+//             Err(e) => Err(e),
+//         }
+//     }
+// }
+
+// fn toomuch(_: Option<File>, _: i64) {
+//     // This function's logic depends on later parts of the code, 
+//     // thus would need adaptation when implementing `do_rexp` and others.
+// }
+
+fn usage() {
+    eprintln!("usage: csplit [-ks] [-f prefix] [-n number] file args ...");
+    process::exit(1);
+}
+
+// Setup signal handling similar to the original C code.
+// fn setup_signal_handling() {
+//     signal_hook::flag::register(signal_hook::consts::signal::SIGHUP, std::sync::atomic::Ordering::SeqCst);
+//     signal_hook::flag::register(signal_hook::consts::signal::SIGINT, std::sync::atomic::Ordering::SeqCst);
+//     signal_hook::flag::register(signal_hook::consts::signal::SIGQUIT, std::sync::atomic::Ordering::SeqCst);
+//     signal_hook::flag::register(signal_hook::consts::signal::SIGTERM, std::sync::atomic::Ordering::SeqCst);
+// }
+fn setup_signal_handling() -> io::Result<()> {
+    let mut signals = Signals::new(TERM_SIGNALS)?;
+    let term_flag = Arc::new(AtomicBool::new(false));
+
+    for sig in signals.forever() {
+        term_flag.store(true, Ordering::Relaxed);
+    }
+
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        usage();
+    }
+
+    let mut state = GlobalState::new();
+
+    let mut patterns = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-f" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Option -f requires an argument.");
+                    process::exit(1);
+                }
+                state.prefix = args[i].clone();
+            }
+            "-k" => state.kflag = true,
+            "-n" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Option -n requires an argument.");
+                    process::exit(1);
+                }
+                state.sufflen = args[i].parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid suffix length.");
+                    process::exit(1);
+                });
+            }
+            "-s" => state.sflag = true,
+            _ => {
+                if !args[i].starts_with('-') {
+                    break;
+                } else {
+                    break;
+                    eprintln!("Unknown option: {}", args[i]);
+                    // process::exit(1);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if i == args.len() {
+        usage();
+    }
+
+    state.infn = args[i].clone();
+    i += 1;
+
+    println! {"prefix: {}, sufflen: {}, sflag: {}, kflag: {}, infn: {}", state.prefix, state.sufflen, state.sflag, state.kflag, state.infn};
+
+    if state.infn == "-" {
+        // let file = File::open("/dev/stdin")?;
+        // state.infile = Some(Box::new(BufReader::new(file)));
+        let mut buffer = String::new();
+        let stdin = io::stdin();
+        let mut handle = stdin.lock();
+        let filepath = "tempfile.tmp";
+
+        let file = File::create(filepath)?;
+        let mut writer = BufWriter::new(file);
+
+        // Read lines from stdin and write them to the file
+        for line in handle.lines() {
+            let line = line?;
+            writeln!(writer, "{}", line)?;
+        }
+
+        state.infile = Some(Box::new(BufReader::new(File::open(filepath)?)));
+
+        // eprintln!("Reading from standard input is not supported.");
+        // process::exit(1);
+    } else {
+        let file = File::open(&state.infn)?;
+        state.infile = Some(Box::new(BufReader::new(file)));
+    }
+
+    while i < args.len() {
+        if args[i].starts_with("/") || args[i].starts_with("%") {
+            // read until the closing "/" or "%" is found
+            // println!("Pattern: {}", args[i]);
+            let mut temp = args[i].clone();
+            i += 1;
+            while i < args.len() && (!args[i].ends_with("/") || !args[i].ends_with("%")) {
+                temp += &(" ".to_owned() + &args[i].clone());
+                i += 1;
+            }
+
+            // println!("Pattern: {}", temp);
+            patterns.push(temp);
+        } else if args[i].chars().all(char::is_numeric) {
+            patterns.push(args[i].clone());
+        } else {
+            eprintln!("{}: unrecognized pattern", args[i]);
+            process::exit(1);
+        }
+        i += 1;
+    }
+
+    // if !state.kflag {
+    //     // Rust equivalent of cleanup on program exit would involve implementing Drop trait or explicitly cleaning up before exiting.
+    //     state.doclean = true;
+    // }
+
+    // Actual file handling
+    // let infile = state.infile.take().unwrap(); // Safe because we just set this
+    // let reader = BufReader::new(infile);
+    for expr in patterns {
+        if expr.starts_with('/') || expr.starts_with('%') {
+            do_rexp(&mut state, &expr)?;
+            // do_rexp(&mut state, &expr)?;
+            // Implement do_rexp function logic here
+        } else if expr.chars().all(char::is_numeric) {
+           do_lineno(&mut state, &expr)?;
+            // Implement do_lineno function logic here
+        } else {
+            eprintln!("{}: unrecognized pattern", expr);
+            process::exit(1);
+        }
+    }
+
+    // print the rest of the file 
+    // Temporarily take the infile out of state to avoid multiple mutable borrows.
+    if let Some(mut infile) = state.infile.take() {
+        let mut ofp = newfile(&mut state)?;
+        let mut ofp_writer = BufWriter::new(&mut ofp);
+        let mut reader = BufReader::new(infile);
+        let mut line = String::new();
+
+        while reader.read_line(&mut line)? != 0 {
+            // println!("Line: {}", line);
+            ofp_writer.write_all(line.as_bytes())?;
+            line.clear(); // Make sure to clear the line buffer after writing it out.
+        }
+
+        // Flush the output writer to ensure all data is written out.
+        ofp_writer.flush()?;
+
+        // Once done, put the infile back into state
+        // state.infile.replace(BufReader::new(reader.into_inner()));
+    }
+
+
+
+
+    // Final cleanup
+    if state.doclean {
+        cleanup(&state)?;
+    }
+
+    Ok(())
+}
+
+// fn handlesig() {
+//     let msg = "csplit: caught signal, cleaning up\n";
+//     let _ = io::stderr().write_all(msg.as_bytes());
+//     // Assuming cleanup function exists and is adjusted for Rust
+//     cleanup().expect("Error during cleanup");
+//     process::exit(2);
+// }
+
+// Create a new output file, adapting for Rust
+fn newfile(state: &mut GlobalState) -> io::Result<File> {
+    let filename = format!("{}{:0width$}", state.prefix, state.nfiles, width = state.sufflen);
+    let path = PathBuf::from(&filename);
+    if path.as_os_str().len() as usize >= 100 {
+        return Err(io::Error::new(io::ErrorKind::Other, "Filename too long"));
+    }
+
+    let file = File::create(&path)?;
+    state.currfile = path;
+    state.nfiles += 1;
+    Ok(file)
+}
+
+fn get_line(reader: &mut BufReader<File>, state: &mut GlobalState) -> io::Result<Option<String>> {
+    let mut line = String::new();
+    let bytes_read = if let Some(ref mut overfile) = state.overfile {
+        let mut overfile = BufReader::new(overfile);
+        overfile.read_line(&mut line)?
+    } else if let Some(ref mut infile) = state.infile {
+        infile.read_line(&mut line)?
+    } else {
+        0 // No file to read from
+    };
+
+    if bytes_read == 0 {
+        Ok(None) // EOF or no input available
+    } else {
+        state.lineno += 1;
+        Ok(Some(line))
+    }
+}
+
+// Rewinds the "conceptual" input n lines back, adapted for Rust
+fn toomuch(state: &mut GlobalState, ofp: &mut File, n: i64) -> io::Result<()> {
+    if let Some(ref mut overfile) = state.overfile {
+        overfile.set_len(state.truncofs)?;
+        overfile.sync_all()?;
+        drop(overfile); // Explicitly drop to close the file
+        state.overfile = None;
+    }
+
+    if n == 0 {
+        return Ok(()); // Just tidying up
+    }
+
+    let mut n = n; // Mutable copy of n for decrementing
+    state.lineno -= n;
+
+    // Seek backwards in ofp to find the position n lines before the current one
+    let mut pos = ofp.stream_position()?;
+    while n > 0 && pos > 0 {
+        let seek_back = std::cmp::min(pos, 4096); // Seek back in increments, 4096 bytes for example
+        pos -= seek_back;
+        ofp.seek(SeekFrom::Start(pos))?;
+
+        let mut buffer = vec![0; seek_back as usize];
+        ofp.read_exact(&mut buffer)?;
+        for &byte in buffer.iter().rev() {
+            if byte == b'\n' {
+                n -= 1;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+
+        ofp.seek(SeekFrom::Start(pos))?; // Rewind after reading
+    }
+
+    // Adjusting ofp to point to the right position after rewinding
+    ofp.seek(SeekFrom::Start(pos + n as u64))?;
+    Ok(())
+}
+
+fn do_rexp(state: &mut GlobalState, expr: &str) -> io::Result<()> {
+    let re = &expr[1..expr.len()-1]; // Extract regex pattern
+    let regex = Regex::new(re).expect("Bad regular expression");
+
+    let mut ofp = if expr.starts_with('/') {
+        // Save results to a file
+        newfile(state)?
+    } else {
+        // Make a temporary file for overflow
+        File::create("tempfile.tmp")? // Using a hardcoded name for simplicity; consider generating a unique name
+    };
+
+    let mut ofp_writer = BufWriter::new(&ofp);
+
+    let mut lineno = 1;
+    let mut matched = false;
+
+    if let Some(ref mut infile) = state.infile {
+        // let mut reader = BufReader::new(infile);
+        let mut line = String::new();
+
+        while true {
+            if infile.read_line(&mut line)? == 0 {
+                break; // EOF reached
+            }
+
+            if regex.is_match(&line) { // Matches the line, re-add the line to the infile
+                infile.seek(SeekFrom::Current(-(line.len() as i64)))?;
+                // println!("Matched: {}, regex: {}", line, re);
+                matched = true;
+                break;
+            }
+
+            ofp_writer.write_all(line.as_bytes())?;
+            state.lineno += 1;
+            line.clear();
+        }
+
+    }
+
+    if !matched {
+        // Handling no match scenario similar to C's error handling
+        return Err(io::Error::new(io::ErrorKind::Other, "No match"));
+    }
+
+    Ok(())
+}
+
+fn do_lineno(state: &mut GlobalState, expr: &str) -> io::Result<()> {
+    let tgtline: i64 = expr.parse().expect("Bad line number");
+
+    if tgtline <= 0 {
+        // Handle bad line number
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Bad line number"));
+    }
+
+    if tgtline <= state.lineno {
+        // Can't go backwards
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Can't go backwards"));
+    }
+
+    let mut ofp = newfile(state)?;
+    let mut ofp_writer = BufWriter::new(&ofp);
+    // let mut infile = state.infile.take()(); // Safe to unwrap since we just set this
+    if let Some(ref mut infile) = state.infile {
+        // let mut reader = BufReader::new(infile);
+        let mut line = String::new();
+
+        while state.lineno < tgtline - 1 {
+            if infile.read_line(&mut line)? == 0 {
+                // Handle out of range
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Out of range"));
+            }
+            ofp_writer.write_all(line.as_bytes())?;
+            state.lineno += 1;
+            line.clear();
+        }
+
+        // state.infile = Some(reader.into_inner());
+    }
+
+    Ok(())
+}
